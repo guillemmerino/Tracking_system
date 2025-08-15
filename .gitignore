@@ -1,0 +1,7 @@
+*.gif
+scripts/
+!scripts/main.py
+!scripts/lstm_track.py
+!scripts/knn_track.py
+!scripts/csv_treatment.py
+!scripts/visualizar_tracking.py

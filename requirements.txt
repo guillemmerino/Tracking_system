@@ -1,0 +1,11 @@
+# Este script corre dentro un contenedor Docker
+requests
+numpy
+pandas
+matplotlib
+scikit-learn
+tensorflow==2.18.0
+smplx
+FastAPI
+requests
+uvicorn[standard]
