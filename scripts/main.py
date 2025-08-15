@@ -2,6 +2,7 @@ import csv
 import os
 import numpy as np
 from knn_track import asignar_ids_por_proximidad
+from hungarian_track import asignar_ids_por_hungaro
 from lstm_track import predecir_lstm
 from visualizar_tracking import visualizar_tracking
 
@@ -49,16 +50,13 @@ for fila in datos:
         # TIENE EL PROBLEMA DE QUE SI UNA PERSONA DESAPARECE, O NO SE DETECTAN
         # GRAN PARTE DE SUS ARTICULACIONES, ASIGNA LOS IDs MAL (PUES SE TOMAN 
         # LOS VALORES ANTERIORES Y LAS DIFERENCIAS SE APROXIMAN A 0)
-        #if frame_actual < 5:
-        #    print(f"Procesando frame {frame_actual} con {len(personas_actual)} personas y keypoints {[p['keypoints'] for p in personas_actual]}")
-        personas_actual_ID, personas_anterior_ID, next_id, desaparecidos_frame = asignar_ids_por_proximidad(
+
+        personas_actual_ID, personas_anterior_ID, next_id, desaparecidos_frame = asignar_ids_por_hungaro(
             personas_actual, personas_anterior, next_id, umbral
         )
-        #if frame_actual < 5:
-        #    print(f"Procesando personas después de la asignación y keypoints {[p['keypoints'] for p in personas_actual_ID]}")
 
-        # Se devuelve un diccionario (ahora personas_actual = personas_anterior) el cual da 
-        # {ID , 'keypoints', 'frame'}
+        # Se devuelve una lista de diccionarios (ahora personas_actual = personas_anterior) el cual da 
+        # [{ID , 'keypoints', 'frame'},...]
  
 
         # -----------------------------------
