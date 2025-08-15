@@ -1,9 +1,8 @@
 import csv
 import os
 import numpy as np
-from knn_track import asignar_ids_por_proximidad
-from hungarian_track import asignar_ids_por_hungaro
-from lstm_track import predecir_lstm
+from asginacion_def import seleccionar_asignacion_definitiva
+from scipy.optimize import linear_sum_assignment
 from visualizar_tracking import visualizar_tracking
 
 BASE = os.getenv("DATA_DIR", "../csv")  # valor por defecto dentro del contenedor
@@ -18,7 +17,7 @@ with open(ruta_csv, 'r') as f:
 personas_anterior = []
 personas_anterior_ID = []
 next_id = 0
-umbral = 1.0  # Ajusta según tus datos
+umbral = 0.1  # Ajusta según tus datos
 frame_actual = None
 frames_personas = []
 personas_actual = []
@@ -29,7 +28,7 @@ umbral_prediccion = 0.5
 ids_invalidos = {}
 dict_predicciones = {}
 keypoints_mod = []
-desaparecidos_frame = {}
+desaparecidos_greedy = {}
 desaparecidos = {}
 umbral_desaparecidos = 0.5
 count = 0
@@ -43,24 +42,21 @@ for fila in datos:
     # Si cambia el frame, procesar asignaciones
     if frame != frame_actual and personas_actual:
 
+        # HAY QUE HACER UNA LIMPIEZA DE KEYPOINTS PARA QUE NO INCLUYA LAS COORDENADAS 
+        # QUE NO SE USAN EN LA LSTM (NI EN EL CODIGO)
 
         # -----------------------------------
-        # 1) LLAMAMOS A ASIGNACION POR PROXIMIDAD
+        # 1) LLAMAMOS A ASIGNACION DEFINITIVA
         # -----------------------------------
-        # TIENE EL PROBLEMA DE QUE SI UNA PERSONA DESAPARECE, O NO SE DETECTAN
-        # GRAN PARTE DE SUS ARTICULACIONES, ASIGNA LOS IDs MAL (PUES SE TOMAN 
-        # LOS VALORES ANTERIORES Y LAS DIFERENCIAS SE APROXIMAN A 0)
-
-        personas_actual_ID, personas_anterior_ID, next_id, desaparecidos_frame = asignar_ids_por_hungaro(
-            personas_actual, personas_anterior, next_id, umbral
+        #print("Frame actual:", frame_actual)
+        personas_actual_ID, personas_anterior_ID, desaparecidos_frame, next_id = seleccionar_asignacion_definitiva(
+            personas_actual, personas_anterior, dict_predicciones, next_id,
+            umbral, peso_pred_vs_prev=0.5, frame_actual=frame_actual
         )
 
-        # Se devuelve una lista de diccionarios (ahora personas_actual = personas_anterior) el cual da 
-        # [{ID , 'keypoints', 'frame'},...]
- 
-
+        #print ("IDs actuales:", [p['id'] for p in personas_actual_ID])
         # -----------------------------------
-        # 2) ACTUALIZACION IDs DESAPARECIDOS 
+        # ?) ACTUALIZACION IDs DESAPARECIDOS 
         # -----------------------------------
         # Comprobamos la lista de desaparecidos en este frame y actualizamos la lsita
         # de desaparecidos global
@@ -69,26 +65,6 @@ for fila in datos:
                 desaparecidos[id_] = {"keypoints": keypoints, "frame_count" : 0}
 
         
-
-        # -----------------------------------
-        # COMPROBAMOS LA PREDICCIÓN SI HAY
-        # -----------------------------------
-        # Si ya tenemos una predicción
-        if len(dict_predicciones) > 0:
-            # Iteramos sobre las personas del frame actual, vemos si el punto con 
-            # ID ya asignado tiene una predicción, y vemos la distancia entre ellos
-            for persona in personas_actual_ID:
-                if persona['id'] in dict_predicciones:
-                    keypoints = dict_predicciones[persona['id']]
-                    distancia = np.linalg.norm(keypoints - persona['keypoints'])
-
-                    # Damos por valida o no la asignacion por knn
-                    if distancia < umbral_prediccion:
-                        print(f"Se valida la prediccion del ID {persona['id']}, distancia {distancia}")
-
-                    else:
-                        print(f"Se invalida la prediccion del ID {persona['id']}, distancia {distancia}")
-                        ids_invalidos[persona['id']] = persona['keypoints']
 
 
         # -----------------------------------
@@ -116,15 +92,10 @@ for fila in datos:
                     # ya no está desaparecido
                     desaparecidos.pop(mejor_id, None)
                     
-        #if count >80 and count < 100:
-        #    print("Desaparecidos:", desaparecidos.keys())
 
-        #    print("Personas frame: ", [p["id"] for p in personas_actual_ID])
-        #count += 1
-        # -----------------------------------
-        # 4) Historial (usa SIEMPRE el ID actual/corregido)
-        # -----------------------------------
-    
+        # -------------------------------------------------
+        # 4) ACTUALIZAMOS HISTORIAL
+        # -------------------------------------------------
         for persona in personas_actual_ID:
             id_ = persona['id']            # <-- refrescado tras una posible reasignación
             keypoints = persona['keypoints']
@@ -135,7 +106,7 @@ for fila in datos:
                 keypoints = np.where(keypoints == 0, last_valid, keypoints)
             historial[id_].append(keypoints)
             persona['keypoints'] = keypoints  # Actualizamos los keypoints con el último válido
-            if len(historial[id_]) > 20:
+            if len(historial[id_]) > 22:
                 historial[id_] = historial[id_][-20:]
 
         # -----------------------------------
@@ -157,15 +128,24 @@ for fila in datos:
                 #print(f"Se elimina el ID {id_} de los desaparecidos")
                 desaparecidos.pop(id_, None)
 
-
+        # ---------------------------------------------------
+        # ?)  REALIZAMOS PREDICCIONES PARA EL SIGUIENTE FRAME 
+        # ---------------------------------------------------
+        # Por cada persona del frame actual
+        for persona in personas_actual_ID:
+            id_ = persona['id']
+            # Si en su historial hay más de 20 frames, predecimos la siguiente posición            
+            if len(historial[id_]) >= 20:
+                secuencia = np.array(historial[id_][-20:])  # Últimos 20 frames
+                #prediccion = predecir_lstm(modelo_lstm, secuencia)
+                #print(f"Frame {frame} | ID {id_} | Predicción LSTM: {prediccion}")
+                # Guardamos la predicción para ese ID en el dict_predicciones
+                #dict_predicciones[id_] = prediccion
 
         # El diccionario dict_predicciones es de la forma
         # {ID : 'keypoints'}
 
         personas_anterior = [dict(p) for p in personas_actual_ID]
-        #if frame_actual < 5:
-        #    print(f"Frame {frame_actual}, personas actual ID: {[p['keypoints'] for p in personas_actual_ID]}")
-        #    print(f"Frame {frame_actual}, personas anterior: {[p['keypoints'] for p in personas_anterior]}")
         personas_actual = []
 
 
@@ -174,16 +154,20 @@ for fila in datos:
 
 # Procesar el último frame
 if personas_actual:
-    personas_actual_ID, personas_anterior_ID, next_id, desaparecidos_frame = asignar_ids_por_proximidad(
-            personas_actual, personas_anterior, next_id, umbral
-        )
+    print("Last frame")
 
+    #print("Frame actual:", frame_actual)
+    personas_def, personas_anterior, desaparecidos_frame, next_id = seleccionar_asignacion_definitiva(
+        personas_actual, personas_anterior, dict_predicciones, next_id,
+        umbral_geom=1.0, peso_pred_vs_prev=0.5, frame_actual=frame_actual
+)    
+    
     # -----------------------------------
     # 2) ACTUALIZACION IDs DESAPARECIDOS 
     # -----------------------------------
     # Comprobamos la lista de desaparecidos en este frame y actualizamos la lsita
     # de desaparecidos global
-    for id_, keypoints in desaparecidos_frame.items():
+    for id_, keypoints in desaparecidos_greedy.items():
         if id_ not in desaparecidos:
             desaparecidos[id_] = {"keypoints": keypoints, "frame_count" : 1}
         else:
@@ -248,18 +232,47 @@ if personas_actual:
 
 
 visualizar_tracking(frames_personas, output_gif="tracking.gif")
-'''        # -----------------------------------
-        # LLAMAMOS A ASIGNACION POR LSTM
+
+
+
+''' # HAY QUE HACER UNA LIMPIEZA DE KEYPOINTS PARA QUE NO INCLUYA LAS COORDENADAS 
+        # QUE NO SE USAN EN LA LSTM (NI EN EL CODIGO)
+
         # -----------------------------------
+        # 1) LLAMAMOS A ASIGNACION GREEDY
+        # -----------------------------------
+        # TIENE EL PROBLEMA DE QUE SI UNA PERSONA DESAPARECE, O NO SE DETECTAN
+        # GRAN PARTE DE SUS ARTICULACIONES, ASIGNA LOS IDs MAL (PUES SE TOMAN 
+        # LOS VALORES ANTERIORES Y LAS DIFERENCIAS SE APROXIMAN A 0)
 
-            # Si el historial es mayor a 20, predice la siguiente posición
-            if len(historial[id_]) > 20:
-                secuencia = np.array(historial[id_][-20:])  # Últimos 20 frames
-                prediccion = predecir_lstm(modelo_lstm, secuencia)
-                print(f"Frame {frame} | ID {id_} | Predicción LSTM: {prediccion}")
-            else:
-                prediccion = []
+        personas_actual_ID_greedy, personas_anterior_ID_greedy, next_id, desaparecidos_greedy = asignar_ids_por_proximidad(
+            personas_actual, personas_anterior, next_id, umbral
+        )
 
-            # Creamos un diccionario con las predicciones de cada ID para el siguiente
-            # frame
-            dict_predicciones[id_] = prediccion'''
+        # -------------------------------------
+        # 2) LLAMAMOS A LA ASINGACIÓN POR LSTM
+        # -------------------------------------
+        # Si ya tenemos una predicción
+        if len(dict_predicciones) > 0:
+            
+            personas_actual_ID_lstm, dict_predicciones, desaparecidos_lstm, next_id = asignar_ids_por_lstm(
+                personas_actual, personas_anterior, next_id, umbral_prediccion
+            )
+
+        # ------------------------------------------
+        # 3) LLAMAMOS A LA ASINGACIÓN POR HUNGARIAN
+        # ------------------------------------------
+        # Si ya tenemos una predicción
+            
+        personas_actual_ID_hung, personas_anterior_ID_hung, desaparecidos_hung, next_id = asignar_ids_por_hungaro(
+            personas_actual, personas_anterior, next_id, umbral_prediccion
+        )
+
+
+        # -------------------------------------------
+        # 3) COMPARAMOS ASIGNACIONES Y DESAPARECIDOS
+        # -------------------------------------------
+
+        personas_actual_ID = personas_anterior_ID_greedy
+        desaparecidos = desaparecidos_greedy
+'''

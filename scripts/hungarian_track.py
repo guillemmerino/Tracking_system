@@ -11,16 +11,6 @@ def asignar_ids_por_hungaro(personas_actual, personas_anterior, next_id, umbral=
     """
     desaparecidos = {}
 
-    # 0) Filtrar entradas "todas a 0"
-    personas_filtradas = []
-    for persona in personas_actual:
-        if np.all(persona['keypoints'] == 0):
-            # puedes loggear si quieres
-            pass
-        else:
-            personas_filtradas.append(persona)
-    personas_actual = personas_filtradas
-
     # Si no había anteriores, asigna IDs nuevos y termina
     if not personas_anterior:
         for p in personas_actual:
@@ -39,7 +29,7 @@ def asignar_ids_por_hungaro(personas_actual, personas_anterior, next_id, umbral=
         # no hay actuales -> todos los anteriores "desaparecen"
         for p in personas_anterior:
             desaparecidos[p['id']] = p['keypoints']
-        return personas_actual, [], next_id, desaparecidos
+        return personas_actual, [dict(p) for p in personas_actual], next_id, desaparecidos
 
     # 2) Relleno por-par (actual 0 -> valor del candidato anterior j)
     # actual_filled_3d: (M, N, D)
@@ -53,6 +43,8 @@ def asignar_ids_por_hungaro(personas_actual, personas_anterior, next_id, umbral=
     diff = actual_filled_3d - keypoints_anterior[None, :, :]
     dist_matrix = np.linalg.norm(diff, axis=2)
 
+    if next_id <18:
+        print("Dist_matrix:", dist_matrix)
     # 4) Método Húngaro
     # Para manejar el umbral: ponemos un coste grande a los emparejamientos que superen el umbral,
     # pero OJO: linear_sum_assignment siempre produce M o N emparejamientos.
