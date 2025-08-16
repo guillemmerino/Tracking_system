@@ -43,8 +43,7 @@ def asignar_ids_por_hungaro(personas_actual, personas_anterior, next_id, umbral=
     diff = actual_filled_3d - keypoints_anterior[None, :, :]
     dist_matrix = np.linalg.norm(diff, axis=2)
 
-    if next_id <18:
-        print("Dist_matrix:", dist_matrix)
+
     # 4) Método Húngaro
     # Para manejar el umbral: ponemos un coste grande a los emparejamientos que superen el umbral,
     # pero OJO: linear_sum_assignment siempre produce M o N emparejamientos.

@@ -6,6 +6,7 @@ MODEL_URL = os.getenv("MODEL_URL", "http://lstm:8000")
 
 def predecir_lstm(data_2d):
     """data_2d: lista de listas con shape (n_muestras, n_features) en el MISMO orden que entrenamiento."""
+    data_2d = data_2d.tolist()
     r = requests.post(f"{MODEL_URL}/predict", json={"data": data_2d}, timeout=30)
     r.raise_for_status()
     body = r.json()
@@ -46,6 +47,9 @@ def asignar_ids_por_lstm(personas_actual, dict_predicciones, next_id, umbral_pre
     preds = np.array([dict_predicciones[i] for i in ids_pred]) if ids_pred else np.empty((0, 0))
     kp_actual = np.array([p['keypoints'] for p in personas_actual]) if personas_actual else np.empty((0, 0))
 
+    #print ("keypoints reales:", kp_actual)
+    #print ("Keypoints predicción LSTM:", preds)
+    #print ("Distancia entre keypoints reales y predicción LSTM:", np.linalg.norm(kp_actual - preds))
     M = len(personas_actual)
     N = len(ids_pred)
 
@@ -71,12 +75,12 @@ def asignar_ids_por_lstm(personas_actual, dict_predicciones, next_id, umbral_pre
     # Matriz de distancias (M, N)
     # Asegúrate de que kp_actual y preds tengan la misma dimensión de features
     dist_matrix = np.linalg.norm(kp_actual[:, None, :] - preds[None, :, :], axis=2)
-
+    #print("Matriz de distancias:", dist_matrix)
     # Umbral: penaliza con coste grande para que Húngaro no las elija
     BIG = 1e9
     cost = dist_matrix.copy()
     cost[cost >= umbral_prediccion] = BIG
-
+    #print("Matriz de costes (con umbral aplicado):", cost)
     row_ind, col_ind = linear_sum_assignment(cost)
 
     # Emparejamientos válidos bajo umbral

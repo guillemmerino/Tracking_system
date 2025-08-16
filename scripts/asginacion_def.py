@@ -31,7 +31,7 @@ def seleccionar_asignacion_definitiva(
     dict_predicciones,         # dict[id:int -> keypoints_pred: np.ndarray]
     next_id,
     umbral_geom,           # igual que tus otros umbrales
-    peso_pred_vs_prev=0.7,      # 0 => solo pasado, 1 => solo predicción; 0.5 mezcla
+    peso_pred_vs_prev=1.3,      # 0 => solo pasado, 1 => solo predicción; 0.5 mezcla
     frame_actual=None
 ):
     """
@@ -52,8 +52,8 @@ def seleccionar_asignacion_definitiva(
     P1 = deepcopy(personas_actual)
     P2 = deepcopy(personas_actual)
 
-    if frame_actual > 85 and frame_actual < 95:
-        print("Personas_actuales:", len(personas_actual))
+    #if frame_actual > 85 and frame_actual < 95:
+    #    print("Personas_actuales:", len(personas_actual))
 
 
     # 1) Propuestas
@@ -62,14 +62,16 @@ def seleccionar_asignacion_definitiva(
     # húngaro (contra el frame anterior)
     prop_hung,   prev_hung, next_id, desc_hung = asignar_ids_por_hungaro(P1, personas_anterior, next_id, umbral=umbral_geom)      # 
 
-    if frame_actual > 85 and frame_actual < 95:
-        print("Propuestas en frame actual:", prop_greedy, prop_hung)
     # lstm (si hay predicciones)
     hay_lstm = bool(dict_predicciones)
     if hay_lstm:
-        prop_lstm, prev_lstm, next_id, desc_lstm = asignar_ids_por_lstm(P2, dict_predicciones, next_id, umbral_prediccion=umbral_geom)  # 
+        prop_lstm, prev_lstm, next_id, desc_lstm = asignar_ids_por_lstm(P2, dict_predicciones, next_id, umbral_prediccion=0.7)  # 
     else:
         prop_lstm, prev_lstm, next_id, desc_lstm = None, None, next_id, {}
+    if frame_actual > 85 and frame_actual < 95:
+        print("Propuestas greedy:", prop_greedy)
+        print("Propuestas húngaras:", prop_hung)
+        print("Propuestas LSTM:", prop_lstm)
 
     # 2) Mayoría + desempate por mejor coste
     prev_map = _map_prev(personas_anterior)

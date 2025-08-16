@@ -4,6 +4,8 @@ import numpy as np
 from asginacion_def import seleccionar_asignacion_definitiva
 from scipy.optimize import linear_sum_assignment
 from visualizar_tracking import visualizar_tracking
+from lstm_track import predecir_lstm
+from limpieza_kp import limpiar_keypoints_por_mapeo
 
 BASE = os.getenv("DATA_DIR", "../csv")  # valor por defecto dentro del contenedor
 CSV = os.path.join(BASE, "apilado.csv")
@@ -23,7 +25,6 @@ frames_personas = []
 personas_actual = []
 personas_actual_ID = []
 historial = {}
-#modelo_lstm = cargar_modelo_lstm()
 umbral_prediccion = 0.5
 ids_invalidos = {}
 dict_predicciones = {}
@@ -39,9 +40,10 @@ for fila in datos:
         float(x) if x.strip() != '' else 0.0
         for x in fila[1:]
     ])
+    keypoints_csv = limpiar_keypoints_por_mapeo(keypoints_csv)
     # Si cambia el frame, procesar asignaciones
     if frame != frame_actual and personas_actual:
-
+        #print("Frame actual:", frame_actual)
         # HAY QUE HACER UNA LIMPIEZA DE KEYPOINTS PARA QUE NO INCLUYA LAS COORDENADAS 
         # QUE NO SE USAN EN LA LSTM (NI EN EL CODIGO)
 
@@ -54,9 +56,9 @@ for fila in datos:
             umbral, peso_pred_vs_prev=0.5, frame_actual=frame_actual
         )
 
-        #print ("IDs actuales:", [p['id'] for p in personas_actual_ID])
+
         # -----------------------------------
-        # ?) ACTUALIZACION IDs DESAPARECIDOS 
+        # 2) ACTUALIZACION IDs DESAPARECIDOS 
         # -----------------------------------
         # Comprobamos la lista de desaparecidos en este frame y actualizamos la lsita
         # de desaparecidos global
@@ -65,7 +67,6 @@ for fila in datos:
                 desaparecidos[id_] = {"keypoints": keypoints, "frame_count" : 0}
 
         
-
 
         # -----------------------------------
         # 3) REIDENTIFICACIÓN IDs ANTIGUOS
@@ -120,6 +121,11 @@ for fila in datos:
             raise ValueError(f"IDs repetidos en frame {frame_actual}: {ids_en_frame}")
         frames_personas.append([dict(p) for p in personas_actual_ID])
 
+
+        # -----------------------------------
+        # 6)  ACTUALIZAMOS CONTADORES 
+        # -----------------------------------
+
         desaparecidos_copy = desaparecidos.copy()
         for id_, value in desaparecidos_copy.items():
             value["frame_count"] += 1
@@ -129,7 +135,7 @@ for fila in datos:
                 desaparecidos.pop(id_, None)
 
         # ---------------------------------------------------
-        # ?)  REALIZAMOS PREDICCIONES PARA EL SIGUIENTE FRAME 
+        # 7)  REALIZAMOS PREDICCIONES PARA EL SIGUIENTE FRAME 
         # ---------------------------------------------------
         # Por cada persona del frame actual
         for persona in personas_actual_ID:
@@ -137,10 +143,21 @@ for fila in datos:
             # Si en su historial hay más de 20 frames, predecimos la siguiente posición            
             if len(historial[id_]) >= 20:
                 secuencia = np.array(historial[id_][-20:])  # Últimos 20 frames
-                #prediccion = predecir_lstm(modelo_lstm, secuencia)
+                
+                #print("Secuencia shape:", secuencia.shape)
+                prediccion = predecir_lstm(secuencia)
+                # Si predecir_lstm devuelve el dict completo:
+                if isinstance(prediccion, dict) and "predictions" in prediccion:
+                    pred = np.array(prediccion["predictions"])
+                else:
+                    pred = np.array(prediccion)
+
+                pred = np.squeeze(pred)
+                if pred.ndim > 1:
+                    pred = pred[0]                
                 #print(f"Frame {frame} | ID {id_} | Predicción LSTM: {prediccion}")
                 # Guardamos la predicción para ese ID en el dict_predicciones
-                #dict_predicciones[id_] = prediccion
+                dict_predicciones[id_] = pred
 
         # El diccionario dict_predicciones es de la forma
         # {ID : 'keypoints'}

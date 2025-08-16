@@ -1,10 +1,8 @@
-# tracking_system/Dockerfile
-FROM python:3.11-slim
+FROM mybase:latest
 
 WORKDIR /app
-COPY service_client.py demo_loop.py requirements.txt /app/
+COPY . /app
 
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir imageio
 
-# Por defecto lanza la demo; luego podrás ejecutar otros scripts con `docker compose exec`
-CMD ["python", "main.py"]
+CMD ["tail", "-f", "/dev/null"]
