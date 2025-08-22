@@ -42,7 +42,7 @@ def seleccionar_asignacion_definitiva(
     for persona in personas_actual:
         if np.all(persona['keypoints'] == 0):
             # Añade a desaparecidos con id None (o puedes manejarlo como prefieras)
-            print("Persona con todo 0 identificada")
+            pass
         else:
             personas_filtradas.append(persona)
     personas_actual = personas_filtradas
@@ -65,13 +65,9 @@ def seleccionar_asignacion_definitiva(
     # lstm (si hay predicciones)
     hay_lstm = bool(dict_predicciones)
     if hay_lstm:
-        prop_lstm, prev_lstm, next_id, desc_lstm = asignar_ids_por_lstm(P2, dict_predicciones, next_id, umbral_prediccion=0.7)  # 
+        prop_lstm, prev_lstm, next_id, desc_lstm = asignar_ids_por_lstm(P2, dict_predicciones, next_id, umbral_prediccion=0.1)  # 
     else:
         prop_lstm, prev_lstm, next_id, desc_lstm = None, None, next_id, {}
-    if frame_actual > 85 and frame_actual < 95:
-        print("Propuestas greedy:", prop_greedy)
-        print("Propuestas húngaras:", prop_hung)
-        print("Propuestas LSTM:", prop_lstm)
 
     # 2) Mayoría + desempate por mejor coste
     prev_map = _map_prev(personas_anterior)
@@ -113,8 +109,6 @@ def seleccionar_asignacion_definitiva(
         for pid, c in conteo.items():
             if pid is not None and c >= 2:
                 pid_mayoria = pid
-                if frame_actual > 85 and frame_actual < 95:
-                    print("Mayoría encontrada en frame", frame_actual, ":", pid_mayoria)
                 break
 
         # (b) si hay mayoría y no está usado, me lo quedo
