@@ -146,8 +146,8 @@ def seleccionar_asignacion_definitiva(
     for blob in (desc_greedy, desc_hung, desc_lstm):
         for k, v in blob.items():
             desaparecidos_def[k] = v
-    if desaparecidos_def:
-        print("Desaparecidos en este frame:", desaparecidos_def.keys())
+    #if desaparecidos_def:
+    #    print("Desaparecidos en este frame:", desaparecidos_def.keys())
 
     # 4) nuevo “personas_anterior” = copia del definitivo
     personas_anterior_nuevo = [dict(p) for p in personas_def]

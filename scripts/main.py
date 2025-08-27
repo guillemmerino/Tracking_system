@@ -1,12 +1,15 @@
 import csv
 import os
+import sys
 import numpy as np
-from asginacion_def import seleccionar_asignacion_definitiva
+from asignacion_mejorada_2 import seleccionar_asignacion_definitiva
 from scipy.optimize import linear_sum_assignment
 from visualizar_tracking import visualizar_tracking
 from lstm_track import predecir_lstm
 from limpieza_kp import limpiar_keypoints_por_mapeo
 from service_client import calculate_score, esta_saltando
+import pandas as pd
+
 
 BASE = os.getenv("DATA_DIR", "../csv")  # valor por defecto dentro del contenedor
 CSV = os.path.join(BASE, "apilado.csv")
@@ -29,38 +32,102 @@ desaparecidos = {}
 personas_saltando = {}
 recientes_evaluados = {}
 hist_saltadores = {}
-umbral_desaparecidos = 0.5
+paciencia_saltador = {}
+kalmans = {}
+track_meta = {}
+UMBRAL_DESAPARECIDOS = 0.5
 next_id = 0
-umbral = 0.1  # Ajusta según tus datos
+UMBRAL_GEOMETRICO = 0.1  # Ajusta según tus datos
 frame_actual = None
 memoria_hist = 100
-paciencia_saltador = {}
 
+# SE DEBE NORMALIZAR LOS DATOS ANTES DE TRATAR CON ELLOS
+# LAS DISTANCIAS CALCULADAS NO PUEDEN COMPARARSE NI LOS UMBRALES SON VALIDOS
 
-for i, fila in enumerate(datos):
+#---------------------------------
+# NORMALIZAR LOS DATOS
+#---------------------------------
+
+df = pd.read_csv(ruta_csv)
+print(df.head())
+# Extraer coordenadas (excluir columna 'frame')
+coord_columns = [col for col in df.columns if col != 'frame']
+coordinates = df[coord_columns].values
+
+# 1. Identificar columnas válidas (no todo NaN)
+valid_columns = [j for j, col in enumerate(coord_columns) if not np.all(np.isnan(coordinates[:, j]))]
+
+# 2. Normalizar solo las columnas válidas
+coordinates_valid = coordinates[:, valid_columns]
+min_val = np.nanmin(coordinates_valid)
+max_val = np.nanmax(coordinates_valid)
+if max_val == min_val:
+    print("❌ No se puede normalizar: max_val == min_val")
+    coordinates_valid_norm = np.zeros_like(coordinates_valid)
+else:
+    coordinates_valid_norm = (coordinates_valid - min_val) / (max_val - min_val)
+
+# 3. Reconstruir el DataFrame con las columnas originales (NaN donde corresponde)
+normalized_df = df.copy()
+for idx, j in enumerate(valid_columns):
+    normalized_df[coord_columns[j]] = coordinates_valid_norm[:, idx]
+
+# 4. El resto de columnas (todo NaN originalmente) se mantienen igual (NaN)
+# 5. Si quieres el array final:
+normalized_coords = normalized_df.values
+print(normalized_coords[0])
+#---------------------------------
+
+for i, fila in enumerate(normalized_coords):
     frame = int(fila[0])
-    keypoints_csv = np.array([
-        float(x) if x.strip() != '' else 0.0
-        for x in fila[1:]
-    ])
+    keypoints_csv = np.nan_to_num(fila[1:], nan=0.0)
     keypoints_csv = limpiar_keypoints_por_mapeo(keypoints_csv)
+
+    # Filtrado de mayoria de kp a 0
+    num_zeros = np.sum(keypoints_csv == 0)
+    umbral_zeros = 20  # Porcentaje de keypoints a cero para descartar (ajusta si quieres)
+    if num_zeros > umbral_zeros:
+        continue
     # Si cambia el frame, procesar asignaciones
     if (frame != frame_actual and personas_actual) or (i == len(datos) - 1 and personas_actual):
-        #if frame_actual % 50 == 0:
-        print("Frame actual:", frame_actual, next_id)
-        # HAY QUE HACER UNA LIMPIEZA DE KEYPOINTS PARA QUE NO INCLUYA LAS COORDENADAS
-        # QUE NO SE USAN EN LA LSTM (NI EN EL CODIGO)
+        print(f"Frame : {frame}, Next ID {next_id}, Personas actuales:", len(personas_actual))       
+        
         next_id_prev = next_id
         # -----------------------------------
         # 1) LLAMAMOS A ASIGNACION DEFINITIVA
         # -----------------------------------
         #print("Frame actual:", frame_actual)
-        personas_actual_ID, personas_anterior_ID, desaparecidos_frame, next_id = seleccionar_asignacion_definitiva(
-            personas_actual, personas_anterior, dict_predicciones, next_id,
-            umbral, peso_pred_vs_prev=0.5, frame_actual=frame_actual
+        personas_actual_ID, personas_anterior_ID, desaparecidos_frame, next_id, kalmans, track_meta = seleccionar_asignacion_definitiva(
+        personas_actual=personas_actual,
+        personas_anterior=personas_anterior,
+        dict_predicciones=dict_predicciones,   # o {} si no hay LSTM
+        kalmans=kalmans,                    # <-- el mismo dict (se actualiza dentro)
+        next_id=next_id,
+        umbral_geom=UMBRAL_GEOMETRICO,
+        dt_seconds=1/60,              # importante para invariancia a FPS
+        track_meta=track_meta
         )
 
+        # Comparamos asignacion con prediccion
+        for persona in personas_actual_ID:
+            id_ = persona['id']
+            asignacion = persona["keypoints"]
+            if id_ in dict_predicciones:
+                prediccion = dict_predicciones[id_]
+                dist = np.linalg.norm(asignacion - prediccion)
+                print(f"ID {id_}: Distancia entre asignación y predicción: {dist:.4f}")
+            if id_ in [p["id"] for p in personas_anterior]:
+                anterior =[p["keypoints"] for p in personas_anterior if p["id"] == id_]
+                dist = np.linalg.norm(asignacion - anterior)
+                print(f"ID {id_}: Distancia entre asignación y anterior: {dist:.7f}")
 
+        #for persona in personas_anterior:
+        #    id_ = persona['id']
+        #    kps = persona['keypoints']
+        #    dist = np.linalg.norm(kps - asignacion)
+        #    print(f"ID {id_}: Distancia entre asignación y anterior: {dist:.4f}")
+
+        # FALTA MECANISMO PARA ELIMINAR GENTE DE KALMANS
 
         # -----------------------------------
         # 2) ACTUALIZACION IDs DESAPARECIDOS 
@@ -70,9 +137,10 @@ for i, fila in enumerate(datos):
         for id_, keypoints in desaparecidos_frame.items():
             if id_ not in desaparecidos:
                 desaparecidos[id_] = {"keypoints": keypoints, "frame_count" : 0}
-
+                print(f"Se añade el ID {id_} a los desaparecidos")
+                
+                
         
-
         # -----------------------------------
         # 3) REIDENTIFICACIÓN IDs ANTIGUOS
         # -----------------------------------
@@ -90,7 +158,7 @@ for i, fila in enumerate(datos):
                     if dist < mejor_dist:
                         mejor_dist, mejor_id = dist, id_olvid
 
-                if mejor_id is not None and mejor_dist < umbral_desaparecidos:
+                if mejor_id is not None and mejor_dist < UMBRAL_DESAPARECIDOS:
                     # RECUPERA EL ID ANTIGUO
                     persona['id'] = mejor_id
                     #print(f"Se recupera el ID {mejor_id} para la persona con ID previo {id_}")
@@ -102,7 +170,7 @@ for i, fila in enumerate(datos):
         # 4) ACTUALIZAMOS HISTORIAL
         # -------------------------------------------------
         for persona in personas_actual_ID:
-            id_ = persona['id']            # <-- refrescado tras una posible reasignación
+            id_ = persona['id']            
             keypoints = persona['keypoints']
             if id_ not in historial:
                 historial[id_] = []
@@ -114,7 +182,6 @@ for i, fila in enumerate(datos):
                     last_valid = last_pred
                 keypoints = np.where(keypoints == 0, last_valid, keypoints)
             historial[id_].append({"frame": frame_actual, "keypoints": keypoints})
-            # EN CASO QUE ESTE SALTANDO LA PERSONA SE PUEDE RELLENAR CON LSTM
             persona['keypoints'] = keypoints  # Actualizamos los keypoints con el último válido
             
             if len(historial[id_]) > memoria_hist:
@@ -128,7 +195,7 @@ for i, fila in enumerate(datos):
                 historial[id_].append({"frame": frame_actual, "keypoints": dict_predicciones.get(id_, np.zeros((17, 3)))})
                 if id_ not in paciencia_saltador:
                     paciencia_saltador[id_] = frame_actual
-            #print(f"Se añade al historial el ID {id_} con predicción LSTM")
+
 
         # -----------------------------------
         # 5)  COMPROBACIÓN DE IDS REPETIDOS 
@@ -152,7 +219,7 @@ for i, fila in enumerate(datos):
             if value["frame_count"] > memoria_hist:
                 # Si lleva más de 20 frames desaparecido
                 #print(f"Se elimina el ID {id_} de los desaparecidos")
-                print(f"Se olvida el ID {id_}")
+                #print(f"Se olvida el ID {id_}")
                 olvidados_ids.append(id_)
                 desaparecidos.pop(id_, None)
 
@@ -202,24 +269,24 @@ for i, fila in enumerate(datos):
         # Tambien realizamos predicciones de aquellas personas saltando que no esten en el frame
         for id_, frame_saltando in personas_saltando.items():
             if id_ not in dict_predicciones:
-                secuencia = np.array([h["keypoints"] for h in historial[id_][-20:]])  # Últimos 20 frames
-                prediccion = predecir_lstm(secuencia)
-                if isinstance(prediccion, dict) and "predictions" in prediccion:
-                    pred = np.array(prediccion["predictions"])
-                else:
-                    pred = np.array(prediccion)
+                if len(historial[id_]) >= 20:
+                    secuencia = np.array([h["keypoints"] for h in historial[id_][-20:]])  # Últimos 20 frames
+                    prediccion = predecir_lstm(secuencia)
+                    if isinstance(prediccion, dict) and "predictions" in prediccion:
+                        pred = np.array(prediccion["predictions"])
+                    else:
+                        pred = np.array(prediccion)
 
-                pred = np.squeeze(pred)
-                if pred.ndim > 1:
-                    pred = pred[0]
+                    pred = np.squeeze(pred)
+                    if pred.ndim > 1:
+                        pred = pred[0]
 
-                dict_predicciones[id_] = pred
+                    dict_predicciones[id_] = pred
 
         # Si hay algun ID asignado mayor a next_id_prev, significa que hemos asignado un nuevo ID
         if any(p['id'] > next_id_prev for p in personas_actual_ID):
             # Se retorna el next_ID
             pass
-
         # Si no se ha asignado un nuevo ID, se mantiene el anterior
         else:
             next_id = next_id_prev
@@ -228,10 +295,6 @@ for i, fila in enumerate(datos):
         # ---------------------------------------------------
         # 8)  VEMOS SI LA PERSONA ESTA SALTANDO 
         # ---------------------------------------------------
-        #print ("PASO (8)")
-        #print ("Personas en el frame actual:", len(personas_actual_ID))
-        # OJO, SOLO SE EVALUAN LAS PERSONAS QUE APARECEN EN ESE FRAME. SI ALGUIEN SE GUARDA COMO SALTANDO
-        # Y DESAPARECE EN ESE FRAME, HAYQ UE VER QUE HACER
         for persona in personas_actual_ID:
             id_ = persona['id']
 
@@ -271,14 +334,11 @@ for i, fila in enumerate(datos):
                         # Añadimos al ID que dejo de saltar para esperar a si vuelve a saltar o no
                         paciencia_saltador[id_] = frame_actual
                         print("Dejó de saltar")
-            # HAY QUE HACER UN TRATAMIENTO ESPECIAL DE LAS PERSONAS SALTANDO, PUES NO PUEDEN TENER
-            # KEYPOINTS IGUAL A 0. 
 
-            # De las personas saltando, accedemos a las últimas posiciones de sus articulaciones
-            # guardadas en el historial
-
+        # De las personas saltando, accedemos a las últimas posiciones de sus articulaciones
+        # guardadas en el historial
         eliminados = []
-        print ("Paciencia saltadores:", paciencia_saltador)
+        #print ("Paciencia saltadores:", paciencia_saltador)
         for id_, frame_paciencia in paciencia_saltador.items():
            # Revisamos el diccionario de paciencia
             if frame_actual - frame_paciencia > 90:
@@ -297,7 +357,7 @@ for i, fila in enumerate(datos):
             hist_saltadores[id_] = historial[id_][-memoria_hist:]
         # De las personas que estan saltando, mandamos sus keypoints para que se procesen en el servicio
         # del cálculo de notas
-        print ("Historial saltadores: ", hist_saltadores.keys())
+        #print ("Historial saltadores: ", hist_saltadores.keys())
         for id_, hist in hist_saltadores.items():
             solo_keypoints = [h["keypoints"] for h in hist]
             score = calculate_score(np.array(solo_keypoints))
