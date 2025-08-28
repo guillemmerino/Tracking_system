@@ -2,6 +2,7 @@ import csv
 import os
 import sys
 import numpy as np
+from asignacion_mejorada_2 import l2
 from asignacion_mejorada_2 import seleccionar_asignacion_definitiva
 from scipy.optimize import linear_sum_assignment
 from visualizar_tracking import visualizar_tracking
@@ -35,14 +36,11 @@ hist_saltadores = {}
 paciencia_saltador = {}
 kalmans = {}
 track_meta = {}
-UMBRAL_DESAPARECIDOS = 0.5
+UMBRAL_DESAPARECIDOS = 0.08
 next_id = 0
 UMBRAL_GEOMETRICO = 0.1  # Ajusta según tus datos
 frame_actual = None
 memoria_hist = 100
-
-# SE DEBE NORMALIZAR LOS DATOS ANTES DE TRATAR CON ELLOS
-# LAS DISTANCIAS CALCULADAS NO PUEDEN COMPARARSE NI LOS UMBRALES SON VALIDOS
 
 #---------------------------------
 # NORMALIZAR LOS DATOS
@@ -59,13 +57,19 @@ valid_columns = [j for j, col in enumerate(coord_columns) if not np.all(np.isnan
 
 # 2. Normalizar solo las columnas válidas
 coordinates_valid = coordinates[:, valid_columns]
-min_val = np.nanmin(coordinates_valid)
+min_val = np.nanmin(coordinates_valid) 
 max_val = np.nanmax(coordinates_valid)
-if max_val == min_val:
-    print("❌ No se puede normalizar: max_val == min_val")
-    coordinates_valid_norm = np.zeros_like(coordinates_valid)
-else:
-    coordinates_valid_norm = (coordinates_valid - min_val) / (max_val - min_val)
+
+# Nueva normalización fila a fila
+coordinates_valid_norm = np.zeros_like(coordinates_valid)
+for i in range(coordinates_valid.shape[0]):
+    fila = coordinates_valid[i]
+    if np.allclose(fila, 0, atol=1e-8):
+        coordinates_valid_norm[i] = 0  # Mantener todo 0 si la fila es todo 0
+    elif max_val == min_val:
+        coordinates_valid_norm[i] = 0
+    else:
+        coordinates_valid_norm[i] = (fila - min_val) / (max_val - min_val)
 
 # 3. Reconstruir el DataFrame con las columnas originales (NaN donde corresponde)
 normalized_df = df.copy()
@@ -82,9 +86,11 @@ for i, fila in enumerate(normalized_coords):
     frame = int(fila[0])
     keypoints_csv = np.nan_to_num(fila[1:], nan=0.0)
     keypoints_csv = limpiar_keypoints_por_mapeo(keypoints_csv)
-
+    if frame == 91:
+        print("Frame 91 keypoints:", keypoints_csv)
     # Filtrado de mayoria de kp a 0
     num_zeros = np.sum(keypoints_csv == 0)
+    print ("num_zeros:", num_zeros)
     umbral_zeros = 20  # Porcentaje de keypoints a cero para descartar (ajusta si quieres)
     if num_zeros > umbral_zeros:
         continue
@@ -92,7 +98,6 @@ for i, fila in enumerate(normalized_coords):
     if (frame != frame_actual and personas_actual) or (i == len(datos) - 1 and personas_actual):
         print(f"Frame : {frame}, Next ID {next_id}, Personas actuales:", len(personas_actual))       
         
-        next_id_prev = next_id
         # -----------------------------------
         # 1) LLAMAMOS A ASIGNACION DEFINITIVA
         # -----------------------------------
@@ -104,31 +109,11 @@ for i, fila in enumerate(normalized_coords):
         kalmans=kalmans,                    # <-- el mismo dict (se actualiza dentro)
         next_id=next_id,
         umbral_geom=UMBRAL_GEOMETRICO,
-        dt_seconds=1/60,              # importante para invariancia a FPS
+        dt_seconds=1/30,              # importante para invariancia a FPS
         track_meta=track_meta
         )
 
-        # Comparamos asignacion con prediccion
-        for persona in personas_actual_ID:
-            id_ = persona['id']
-            asignacion = persona["keypoints"]
-            if id_ in dict_predicciones:
-                prediccion = dict_predicciones[id_]
-                dist = np.linalg.norm(asignacion - prediccion)
-                print(f"ID {id_}: Distancia entre asignación y predicción: {dist:.4f}")
-            if id_ in [p["id"] for p in personas_anterior]:
-                anterior =[p["keypoints"] for p in personas_anterior if p["id"] == id_]
-                dist = np.linalg.norm(asignacion - anterior)
-                print(f"ID {id_}: Distancia entre asignación y anterior: {dist:.7f}")
-
-        #for persona in personas_anterior:
-        #    id_ = persona['id']
-        #    kps = persona['keypoints']
-        #    dist = np.linalg.norm(kps - asignacion)
-        #    print(f"ID {id_}: Distancia entre asignación y anterior: {dist:.4f}")
-
-        # FALTA MECANISMO PARA ELIMINAR GENTE DE KALMANS
-
+        print("IDs actuales:", [p['id'] for p in personas_actual_ID])
         # -----------------------------------
         # 2) ACTUALIZACION IDs DESAPARECIDOS 
         # -----------------------------------
@@ -139,32 +124,6 @@ for i, fila in enumerate(normalized_coords):
                 desaparecidos[id_] = {"keypoints": keypoints, "frame_count" : 0}
                 print(f"Se añade el ID {id_} a los desaparecidos")
                 
-                
-        
-        # -----------------------------------
-        # 3) REIDENTIFICACIÓN IDs ANTIGUOS
-        # -----------------------------------
-        # Se toma la asignación por proximidad y se valora si hay un ID ya fijo
-        for persona in personas_actual_ID:
-            id_ = persona['id']
-            keypoints_actuales = persona['keypoints']
-
-            # Si este ID no existía en historial, podría ser "nuevo" => intenta recuperar
-            if id_ is None or id_ not in historial:
-                mejor_id = None
-                mejor_dist = float('inf')
-                for id_olvid, info in desaparecidos.items():
-                    dist = np.linalg.norm(keypoints_actuales - info["keypoints"])
-                    if dist < mejor_dist:
-                        mejor_dist, mejor_id = dist, id_olvid
-
-                if mejor_id is not None and mejor_dist < UMBRAL_DESAPARECIDOS:
-                    # RECUPERA EL ID ANTIGUO
-                    persona['id'] = mejor_id
-                    #print(f"Se recupera el ID {mejor_id} para la persona con ID previo {id_}")
-                    # ya no está desaparecido
-                    desaparecidos.pop(mejor_id, None)
-                    
 
         # -------------------------------------------------
         # 4) ACTUALIZAMOS HISTORIAL
@@ -283,14 +242,6 @@ for i, fila in enumerate(normalized_coords):
 
                     dict_predicciones[id_] = pred
 
-        # Si hay algun ID asignado mayor a next_id_prev, significa que hemos asignado un nuevo ID
-        if any(p['id'] > next_id_prev for p in personas_actual_ID):
-            # Se retorna el next_ID
-            pass
-        # Si no se ha asignado un nuevo ID, se mantiene el anterior
-        else:
-            next_id = next_id_prev
-            #print(f"Se mantiene el ID anterior: {next_id}")
 
         # ---------------------------------------------------
         # 8)  VEMOS SI LA PERSONA ESTA SALTANDO 
@@ -373,3 +324,31 @@ for i, fila in enumerate(normalized_coords):
     frame_actual = frame
 
 visualizar_tracking(frames_personas)
+
+                
+        
+'''        # -----------------------------------
+        # 3) REIDENTIFICACIÓN IDs ANTIGUOS
+        # -----------------------------------
+        # Se toma la asignación por proximidad y se valora si hay un ID ya fijo
+        for persona in personas_actual_ID:
+            id_ = persona['id']
+            keypoints_actuales = persona['keypoints']
+
+            # Si este ID no existía en historial, podría ser "nuevo" => intenta recuperar
+            if id_ is None or id_ not in historial:
+                mejor_id = None
+                mejor_dist = float('inf')
+                for id_olvid, info in desaparecidos.items():
+                    dist = l2(np.asarray(keypoints_actuales), np.asarray(info["keypoints"]))
+                    if dist < mejor_dist:
+                        mejor_dist, mejor_id = dist, id_olvid
+
+                if mejor_id is not None and mejor_dist < UMBRAL_DESAPARECIDOS:
+                    # RECUPERA EL ID ANTIGUO
+                    persona['id'] = mejor_id
+                    print(f"Se recupera el ID {mejor_id} para la persona con ID previo {id_}")
+                    # ya no está desaparecido
+                    desaparecidos.pop(mejor_id, None)
+                    
+'''

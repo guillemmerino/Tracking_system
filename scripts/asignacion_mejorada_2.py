@@ -1,17 +1,33 @@
 import numpy as np
 from copy import deepcopy
 from typing import Dict, Tuple, List, Optional
-
+try:
+    from scipy.optimize import linear_sum_assignment
+    HAVE_SCIPY = True
+except Exception:
+    HAVE_SCIPY = False
 # ==========================================================
 # Utilidades de geometría / KP helpers
 # ==========================================================
 
+# Calculo de una norma L2 (RMSE por joint visible)
 def l2(a: np.ndarray, b: np.ndarray) -> float:
     if a is None or b is None:
         return float('inf')
-    return float(np.linalg.norm(np.asarray(a, dtype=float) - np.asarray(b, dtype=float)))
+    a = np.asarray(a, float).reshape(-1)
+    b = np.asarray(b, float).reshape(-1)
+    step = 3 if (a.size % 3 == 0 and b.size % 3 == 0) else 2  # (x,y,[conf])
+    ax, ay = a[0::step], a[1::step]
+    bx, by = b[0::step], b[1::step]
+    m = (ax != 0) & (ay != 0) & (bx != 0) & (by != 0)         # joints visibles en ambos
+    if not np.any(m):
+        return float('inf')
+    dx = ax[m] - bx[m]
+    dy = ay[m] - by[m]
+    # RMSE por joint visible (≈ L2 / sqrt(2*J_vis))
+    return float(np.sqrt(((dx*dx + dy*dy)).mean()))
 
-
+# Separa el array de kp en kp_x y kp_y
 def split_xy(kp):
     """Acepta (J,2)/(J,3) o plano 2J/3J. Devuelve xs, ys (1D)."""
     kp = np.asarray(kp, dtype=float)
@@ -22,7 +38,7 @@ def split_xy(kp):
         xs, ys = kp[0::step], kp[1::step]
     return xs, ys
 
-
+# Del array de kp, crea un boundary box
 def keypoints_to_box(kp: np.ndarray) -> Tuple[float, float, float, float]:
     xs, ys = split_xy(kp)
     m = (xs != 0) & (ys != 0)
@@ -33,14 +49,19 @@ def keypoints_to_box(kp: np.ndarray) -> Tuple[float, float, float, float]:
     ymin, ymax = float(ys.min()), float(ys.max())
     return (xmin, ymin, xmax, ymax)
 
-
+# De un array de kp, crea una caja y obtiene su centro (x,y)
 def bbox_center_from_kp(kp: np.ndarray) -> np.ndarray:
     x1, y1, x2, y2 = keypoints_to_box(kp)
     return np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0], dtype=float)
 
-
+# Cálculo de la intersección sobre la unión de bboxes
 def iou_from_boxes(a: Tuple[float, float, float, float],
                    b: Tuple[float, float, float, float]) -> float:
+    '''
+        Cálculo de la intersección sobre la unión de bboxes.
+        Retorna el factor IoU (Intersection over Union).
+        Cuanto más se parezcan la bboxes, mayor será el IoU.
+    '''
     ax1, ay1, ax2, ay2 = a
     bx1, by1, bx2, by2 = b
     inter_x1 = max(ax1, bx1)
@@ -57,19 +78,37 @@ def iou_from_boxes(a: Tuple[float, float, float, float],
         return 0.0
     return float(inter / union)
 
+def robust_center_from_kp(kp: np.ndarray) -> np.ndarray:
+    """Centro robusto: mediana de keypoints válidos; fallback al centro del bbox
+       en caso de haber más de 3 coordenadas igual a 0.
+    """
+    xs, ys = split_xy(kp)
+    m = (xs != 0) & (ys != 0) # Boolean mask
+    
+    if np.count_nonzero(m) >= 3:
+        return np.array([float(np.median(xs[m])), float(np.median(ys[m]))], dtype=float)
+    return bbox_center_from_kp(kp)
+
 
 # ==========================================================
-# Kalman Filter 2D (x,y,vx,vy) con forma de Joseph y piso de P
+# Kalman Filter 2D (x,y,vx,vy) con forma de Joseph y piso en P
 # ==========================================================
-
 class KalmanCV2D:
+    '''
+        Se estima el estado (posición y velocidad) de un objeto en 2D, se compara
+        al valor real y se corrige la incertidumbre en función de cómo de buena ha 
+        sido la predicción
+    '''
     def __init__(self,
                  q: float = 1e-3,          # ruido de proceso (normalizado)
-                 r_pos: float = 1e-4,      # varianza medición (σ≈0.01)
+                 r_pos: float = 4e-4,      # σ^2, varianza medición (σ≈0.27)
                  P0_pos: float = 1e-3,
                  P0_vel: float = 1e-2,
-                 Pmin_pos: float = 1e-5,
-                 Pmin_vel: float = 5e-4):
+                 Pmin_pos: float = 1e-4,
+                 Pmin_vel: float = 1e-3):
+        '''
+            Instanciamos clase con valores iniciales
+        '''
         self.q_base = float(q)
         self.r_pos = float(r_pos)
         self.P0_pos = float(P0_pos)
@@ -77,42 +116,68 @@ class KalmanCV2D:
         self.Pmin_pos = float(Pmin_pos)
         self.Pmin_vel = float(Pmin_vel)
 
-        self.x = None   # (4,1)
-        self.P = None   # (4,4)
+        
+        self.x = None   # (4,1) Vector de estado (x, y, vel_x, vel_y)
+        self.P = None   # (4,4) Matriz de Incertidumbre
         self.H = np.array([[1, 0, 0, 0],
-                           [0, 1, 0, 0]], dtype=float)
-        self.R = np.eye(2, dtype=float) * self.r_pos
+                           [0, 1, 0, 0]], dtype=float) # (2,4) Matriz de proyección sobre x, y
+        self.R = np.eye(2, dtype=float) * self.r_pos   # (2,2) Matriz de Ruido 
 
     def _F_Q(self, dt: float):
+        '''
+            Matrices de transición y covarianza del proceso
+        '''
         dt = float(max(1e-6, dt))
         F = np.array([[1, 0, dt, 0],
                       [0, 1, 0, dt],
                       [0, 0, 1,  0],
-                      [0, 0, 0,  1]], dtype=float)
+                      [0, 0, 0,  1]], dtype=float) # (4,4) Matriz de transición de estado
         dt2, dt3, dt4 = dt*dt, dt*dt*dt, dt*dt*dt*dt
         q = self.q_base
+
+        # Se añade ruido de transición (proceso)
         Q = q * np.array([[dt4/4, 0,      dt3/2, 0],
                           [0,      dt4/4, 0,      dt3/2],
                           [dt3/2, 0,      dt2,   0],
-                          [0,      dt3/2, 0,      dt2]], dtype=float)
+                          [0,      dt3/2, 0,      dt2]], dtype=float) # (4,4) Matriz de Covarianza del Proceso
         return F, Q
 
     def init_from_measurement(self, z_xy: np.ndarray):
+        '''
+            Inicializa el filtro de Kalman a partir de una medición
+        '''
         x, y = float(z_xy[0]), float(z_xy[1])
         self.x = np.array([[x], [y], [0.0], [0.0]], dtype=float)
         self.P = np.diag([self.P0_pos, self.P0_pos, self.P0_vel, self.P0_vel]).astype(float)
 
     def predict(self, dt: float):
+        '''
+            Realiza la predicción dado un estado y un dt.
+        '''
         if self.x is None:
             raise RuntimeError("Kalman no inicializado")
         F, Q = self._F_Q(dt)
-        self.x = F @ self.x
-        self.P = F @ self.P @ F.T + Q
+        self.x = F @ self.x     # Transición de estado
+        self.P = F @ self.P @ F.T + Q   # Actualización de incertidumbre por transición
 
     def innovation_cov(self) -> np.ndarray:
-        return self.H @ self.P @ self.H.T + self.R
+        '''
+            Covarianza de la innovación. Se trata de la incertidumbre total causada
+            por la transición (P) teniendo en cuenta también el ruido de medición (R).
+            Se proyecta la incertidumbre de estado al espacio de medición y se le agrega
+            el ruido de medición.
+        '''
+        return self.H @ self.P @ self.H.T + self.R # (2,2) Matriz de innovación
 
     def mahalanobis2(self, z_xy: np.ndarray) -> float:
+        '''
+            Se toma un estado medido (z) y el estado estimado (zhat, proyección del estado
+            predicho x). Se encuentra la diferencia relativa entre estados. S_inv @ y modifica
+            el tamaño de la  observación-predicción en función de la confianza que tenga en ella
+            (si confio mucho en mi predicción, penalizaré más el error, la diferencia). 
+            Con y.T obtenemos un escalar de esta magnitud, un valor que indica quan rara es la 
+            medición. Se compara esta distancia a umbrales de confianza estadísticos chi^2.
+        '''
         z = np.array(z_xy, dtype=float).reshape(2, 1)
         zhat = self.H @ self.x
         y = z - zhat
@@ -124,6 +189,14 @@ class KalmanCV2D:
         return float((y.T @ Sinv @ y)[0, 0])
 
     def update(self, z_xy: np.ndarray):
+        '''
+            Combinamos incertidumbre de transición con el inverso de la confianza de la medición.
+            Si la medición es muy confiable (S pequeña) corregimos mucho el estado con ella (K grande).
+            Si la medición es poco confiable (S grande) corregimos poco el estado (K pequeño).
+            Si la predicción es muy confiable (P pequeña) corregimos poco el estado con la medición (K pequeña).
+            Si la predicción es poco confiable (P grande) corregimos mucho el estado con la medición (K grande).
+            K determina cuanto confiamos en el modelo. K pequeña = confiamos
+        '''
         z = np.array(z_xy, dtype=float).reshape(2, 1)
         H = self.H
         S = self.innovation_cov()
@@ -143,15 +216,21 @@ class KalmanCV2D:
         np.fill_diagonal(self.P, np.maximum(diagP, floors))
 
     def predicted_xy(self) -> np.ndarray:
+        '''
+            Retorna la posición (x,y) predicha por predict().
+        '''
         return np.array([(self.H @ self.x)[0, 0], (self.H @ self.x)[1, 0]], dtype=float)
 
 
 def retune_kf_for_normalized(kf: KalmanCV2D,
                              q: float = 1e-3,
-                             r_pos: float = 1e-4,
+                             r_pos: float = 4e-4,
                              P_pos: float = 1e-3,
                              P_vel: float = 1e-2,
                              trace_cap: float = 1.0):
+    '''
+        Se reinician los parámetros sin reiniciar los estados
+    '''
     kf.q_base = float(q)
     kf.R = np.eye(2, dtype=float) * float(r_pos)
     if kf.P is None or np.trace(kf.P) > trace_cap:
@@ -167,7 +246,7 @@ def coste_enriquecido(
     kp_ref_prev: Optional[np.ndarray],
     kp_ref_pred: Optional[np.ndarray],
     bbox_actual: Tuple[float, float, float, float],
-    bbox_pred: Optional[Tuple[float, float, float, float]] = None,
+    bbox_prev: Optional[Tuple[float, float, float, float]] = None,
     conf: Optional[float] = None,
     d2_maha: Optional[float] = None,
     pred_xy_kf: Optional[np.ndarray] = None,
@@ -182,25 +261,38 @@ def coste_enriquecido(
     tau_lstm=0.02,
 ) -> float:
     C, wsum = 0.0, 0.0
+
+    # Coste por kp anteriores
     if kp_ref_prev is not None:
         C += w_prev * l2(kp_actual, kp_ref_prev); wsum += w_prev
+    
+    # Coste por kp predichos por LSTM
     if kp_ref_pred is not None:
         # LSTM en suave y dinámico según error de centro
         cen = bbox_center_from_kp(kp_actual)
         cen_lstm = bbox_center_from_kp(kp_ref_pred)
-        e = float(np.linalg.norm(cen - cen_lstm))
+        e = float(l2(cen, cen_lstm))
         w_lstm_eff = w_pred * np.exp(-(e / tau_lstm) ** 2)
         C += w_lstm_eff * l2(kp_actual, kp_ref_pred); wsum += w_lstm_eff
+    
+    # Coste por predicción Kalman
     if pred_xy_kf is not None:
         cen = bbox_center_from_kp(kp_actual)
-        C += w_kf * float(np.linalg.norm(cen - pred_xy_kf)); wsum += w_kf
-    if bbox_pred is not None:
-        iou = iou_from_boxes(bbox_pred, bbox_actual)
+        C += w_kf * float(l2(cen, pred_xy_kf)); wsum += w_kf
+    
+    # Coste por Iou
+    if bbox_prev is not None:
+        iou = iou_from_boxes(bbox_prev, bbox_actual)
         C += w_iou * (1.0 - iou); wsum += w_iou
+
+    # Coste por confianza
     if conf is not None:
         C += w_conf * (1.0 - float(conf)); wsum += w_conf
+
+    # Coste por Mahalanobis
     if d2_maha is not None:
         C += w_maha * float(d2_maha); wsum += w_maha
+
     # Penalización suave por umbral geométrico (hinge)
     if umbral_geom is not None and mejor_dist_kp is not None:
         over = max(0.0, (mejor_dist_kp - umbral_geom) / max(1e-6, umbral_geom))
@@ -234,10 +326,10 @@ def seleccionar_asignacion_definitiva(
     next_id: int,
     umbral_geom: float,
     dt_seconds: float = 1/30.0,
-    v_max_per_s: float = 1.2,                  # normalizado
+    v_max_per_s: float = 1.8,                  # normalizado
     gating_maha_hard: float = CHI2_999,        # descarte duro
     gating_maha_soft: float = CHI2_99,         # marca coasting
-    pesos_coste: Tuple[float, float, float, float, float, float] = (1.0, 0.2, 0.1, 0.6, 0.1, 0.8),  # w_prev, w_pred, w_iou, w_conf, w_maha
+    pesos_coste: Tuple[float, float, float, float, float, float] = (1.0, 0.2, 0.1, 0.6, 0.1, 0.8),  # w_kf, w_prev, w_pred, w_iou, w_conf, w_maha
     T_lost_seconds: float = 1.0,
     quarantine_seconds: float = 0.25,
     frame_actual: Optional[int] = None,
@@ -265,7 +357,6 @@ def seleccionar_asignacion_definitiva(
         if pid not in kalmans:
             # Inicializa on-demand al final cuando se asigne
             continue
-        retune_kf_for_normalized(kalmans[pid])
         try:
             kalmans[pid].predict(dt_seconds)
         except RuntimeError:
@@ -278,22 +369,30 @@ def seleccionar_asignacion_definitiva(
         P0 = deepcopy(personas_actual)
         P1 = deepcopy(personas_actual)
         P2 = deepcopy(personas_actual)
-        prop_greedy, prev_greedy, next_id, _ = asignar_ids_por_proximidad(P0, personas_anterior, next_id, umbral=umbral_geom)
-        prop_hung,   prev_hung,   next_id, _ = asignar_ids_por_hungaro(P1, personas_anterior, next_id, umbral=umbral_geom)
+        _tmp = next_id
+        prop_greedy, _, _tmp, _ = asignar_ids_por_proximidad(P0, personas_anterior, _tmp, umbral=umbral_geom)
+        prop_hung, _, _tmp, _ = asignar_ids_por_hungaro(P1, personas_anterior, _tmp, umbral=umbral_geom)
         if dict_predicciones:
-            prop_lstm, prev_lstm, next_id, _ = asignar_ids_por_lstm(P2, dict_predicciones, next_id, umbral_prediccion=0.1)
+            prop_lstm, prev_lstm, _tmp, _ = asignar_ids_por_lstm(P2, dict_predicciones, _tmp, umbral_prediccion=0.1)
     # Mapa previo
-    prev_map = {p['id']: p['keypoints'] for p in personas_anterior}
-
+    prev_map = {p['id']: p['keypoints'] for p in personas_anterior if p.get('id') is not None}
+    
+    # Conjunto de IDs previos, con instancia Kalman y en tracking (memoria)
+    valid_prior_ids = set(prev_map.keys()) | set(kalmans.keys()) | {pid for pid in track_meta.keys() if pid != '_clock'}
+    
     # --------- Construcción de candidatos con GATING + anti-hijack ---------
     dist_max = v_max_per_s * max(1e-6, dt_seconds)
     candidates: List[Tuple[int, int, float, float]] = []  # (pid, det_idx, cost, d2)
 
     # Precalcula centros/bboxes actuales
-    det_centers = [bbox_center_from_kp(p['keypoints']) for p in personas_actual]
+    det_centers = [robust_center_from_kp(p['keypoints']) for p in personas_actual]
     det_bboxes  = [keypoints_to_box(p['keypoints']) for p in personas_actual]
 
     # Fuente de candidatos: unimos IDs sugeridos por las propuestas externas y los previos
+    # -------------------------------------------------------------------------
+    #   PRIMER BLOQUE: SUGERENCIAS
+    # -------------------------------------------------------------------------
+
     suggested_ids_per_det = []
     for i, persona in enumerate(personas_actual):
         kp_i = np.asarray(persona['keypoints'])
@@ -301,22 +400,31 @@ def seleccionar_asignacion_definitiva(
         ids = set()
         for prop in (prop_greedy or []):
             # elegimos el id del más cercano de la propuesta a esta detección
-            pid = prop.get('id', None)
-            if pid is not None:
+            pid = prop.get('id')
+            if pid in valid_prior_ids:
                 ids.add(pid)
         for prop in (prop_hung or []):
-            pid = prop.get('id', None)
-            if pid is not None:
+            pid = prop.get('id')
+            if pid in valid_prior_ids:
                 ids.add(pid)
         for prop in (prop_lstm or []):
-            pid = prop.get('id', None)
-            if pid is not None:
+            pid = prop.get('id')
+            if pid in valid_prior_ids:
                 ids.add(pid)
-        # añade todos los previos también (para robustez) — si es muy denso, puedes limitar por distancia al centro
-        ids.update(prev_map.keys())
+
+        # OJO ESTA LINEA. AÑADE TODOS LOS IDS PREVIOS, SIN IMPORTAR LA ASIGNACION, DE MODO
+        # QUE EL BUCLE PIERDE SENTIDO.
+
+        ids.update(valid_prior_ids)
         suggested_ids_per_det.append(list(ids))
 
     def antihijack_ok(pid: int, det_idx: int) -> bool:
+        '''
+            Busca los metadatos del ID que se le pasa, además del  precalculado para el
+            índice det_idx. Devuelve True si está permitido para reasignarse (su distancia
+            Mahalanobis es estadísticamente válida), False si está en cuarentena y el match no
+            es claro.
+        '''
         m = track_meta.get(pid, {})
         cen_i = det_centers[det_idx]
         if pid in kalmans:
@@ -331,28 +439,38 @@ def seleccionar_asignacion_definitiva(
 
     for i, persona in enumerate(personas_actual):
         kp_i = np.asarray(persona['keypoints'])
-        cen_i = det_centers[i]
-        bb_i  = det_bboxes[i]
+        cen_i = det_centers[i]  # Se obtiene el centro previamente calculado
+        bb_i  = det_bboxes[i]   # Se obtiene el bounding box previamente calculado (tupla)
         conf_i = persona.get('conf', None)
 
         for pid in suggested_ids_per_det[i]:
-            # Gating geométrico por centro
             ok = True
             if pid in kalmans:
-                pred_xy = kalmans[pid].predicted_xy()
-                if l2(cen_i, pred_xy) > dist_max:
-                    ok = False
+                pred_xy = kalmans[pid].predicted_xy() # Estado actualizado a este frame
+                center_dist = float(np.linalg.norm(cen_i - pred_xy))
+                sigmas = np.sqrt(np.diag(kalmans[pid].innovation_cov()))  # ~[σx, σy]
+                gate = (v_max_per_s * dt_seconds) + 2.5 * float(np.mean(sigmas))  # margen por S
+                if center_dist > gate: ok = False
+                # Gating geométrico por centro. Filtrado duro. Si la distancia entre el
+                # centro del box y la predicción Kalman esta dentro del umbral, se acepta,
+                # sino, se toma por movimiento muy improbable y se descarta ese id para asignar
                 else:
                     d2 = kalmans[pid].mahalanobis2(cen_i)
-                    if d2 > gating_maha_hard:
+                    # Gating estadístico. Se valora la "rareza" de la observación considerando
+                    # la predicción de Kalman (forma, orientación).
+                    if d2 > gating_maha_hard:   # 0.1% de los casos más improbables. Se descarta
                         ok = False
-                    elif d2 > gating_maha_soft:
-                        # marca coasting; no aceptes directo, pero no mates el track
+                        print(f"Descartando ID {pid} para det {i} por Mahalanobis dura: d2={d2:.2f}")
+                    elif d2 > gating_maha_soft: # 1% de los casos más improbables.
+                        # Se marca como coasting, rara pero no descartable
+                        print(f"Marcando ID {pid} como coasting para det {i} por Mahalanobis suave: d2={d2:.2f}")
                         meta = track_meta.setdefault(pid, {})
                         meta['just_coasted'] = True
                         ok = False
-                    # anti-hijack
+                    
+                    # Si son casos estadísticamente plausibles, se comprueba anti-hijack.
                     if ok and not antihijack_ok(pid, i):
+                        print(f"Descartando ID {pid} para det {i} por anti-hijack en cuarentena")
                         ok = False
             else:
                 # sin Kalman: fallback al kp previo si existe
@@ -368,7 +486,7 @@ def seleccionar_asignacion_definitiva(
             kp_prev = prev_map.get(pid, None)
             kp_pred = dict_predicciones.get(pid, None) if dict_predicciones else None
             pred_xy_kf = kalmans[pid].predicted_xy() if pid in kalmans else None
-            bb_pred = keypoints_to_box(kp_prev) if kp_prev is not None else None
+            bb_prev = keypoints_to_box(kp_prev) if kp_prev is not None else None
             mejor_dist_kp = l2(kp_i, kp_prev) if kp_prev is not None else None
             d2_maha = kalmans[pid].mahalanobis2(cen_i) if pid in kalmans else None
             cost = coste_enriquecido(
@@ -376,52 +494,87 @@ def seleccionar_asignacion_definitiva(
                 kp_ref_prev=kp_prev,
                 kp_ref_pred=kp_pred,
                 bbox_actual=bb_i,
-                bbox_pred=bb_pred,
+                bbox_prev=bb_prev,
                 conf=conf_i,
                 d2_maha=d2_maha,
                 pred_xy_kf=pred_xy_kf,
                 w_kf=w_kf, w_prev=w_prev, w_pred=w_pred, w_iou=w_iou, w_conf=w_conf, w_maha=w_maha,
                 umbral_geom=umbral_geom, mejor_dist_kp=mejor_dist_kp,
             )
+
+            # Se guarda cada coste de cada candidato para cada persona detectada
             candidates.append((pid, i, cost, d2 if pid in kalmans else 0.0))
 
     # Si no hay candidatos (p.ej., todos fuera de gate), podremos hacer re-ID o nacer nuevos
-
-    # --------- Mutual-nearest validation / selección de matches ---------
-    # agrupa por pid y por det idx para encontrar mejores
-    best_det_for_track: Dict[int, Tuple[int, float]] = {}
-    best_track_for_det: Dict[int, Tuple[int, float]] = {}
-    for pid, i, cost, _ in candidates:
-        if (pid not in best_det_for_track) or (cost < best_det_for_track[pid][1]):
-            best_det_for_track[pid] = (i, cost)
-        if (i not in best_track_for_det) or (cost < best_track_for_det[i][1]):
-            best_track_for_det[i] = (pid, cost)
+    # -------------------------------------------------------------------------
+    #   SEGUNDO BLOQUE: ASIGNACIONES
+    # -------------------------------------------------------------------------
 
     assigned_det: Dict[int, int] = {}   # det i -> pid
     used_tracks: set = set()
 
-    # 1) Acepta los mutuos
-    for pid, (i, c) in best_det_for_track.items():
-        pid2, c2 = best_track_for_det.get(i, (None, None))
-        if pid2 == pid:
-            assigned_det[i] = pid
-            used_tracks.add(pid)
+    # --------- Método Húngaro. Optimización costes ---------
+    if HAVE_SCIPY:
+        # 1. Extrae los IDs y detecciones únicas de los candidatos
+        track_ids = sorted({pid for pid, _, _, _ in candidates})
+        det_idxs = sorted({i for _, i, _, _ in candidates})
 
-    # 2) Reglas extra: si no es mutuo, acepta solo si coste es muy bueno (d2 bajo + IoU decente)
-    for pid, (i, c) in best_det_for_track.items():
-        if i in assigned_det:
-            continue
-        if pid in used_tracks:
-            continue
-        cen_i = det_centers[i]
-        d2 = kalmans[pid].mahalanobis2(cen_i) if pid in kalmans else 0.0
-        iou_ok = True
-        kp_prev = prev_map.get(pid, None)
-        if kp_prev is not None:
-            iou_ok = iou_from_boxes(keypoints_to_box(kp_prev), det_bboxes[i]) > 0.2
-        if d2 <= 5.99 and iou_ok:
-            assigned_det[i] = pid
-            used_tracks.add(pid)
+        # 2. Construye la matriz de costes
+        cost_matrix = np.full((len(track_ids), len(det_idxs)), fill_value=1e6)
+        pid_to_row = {pid: idx for idx, pid in enumerate(track_ids)}
+        det_to_col = {i: idx for idx, i in enumerate(det_idxs)}
+
+        for pid, i, cost, _ in candidates:
+            row = pid_to_row[pid]
+            col = det_to_col[i]
+            cost_matrix[row, col] = cost
+
+        # 3. Aplica el método Húngaro
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+
+        # 4. Filtra asignaciones válidas (coste razonable)
+        for r, c in zip(row_ind, col_ind):
+            if cost_matrix[r, c] < 1e5:  # umbral de coste alto
+                pid = track_ids[r]
+                i = det_idxs[c]
+                assigned_det[i] = pid
+                used_tracks.add(pid)
+
+    else:
+
+        # ---------  Método Mutual-nearest validation / selección de matches ---------
+        
+        # agrupa por pid y por det idx para encontrar mejores
+        best_det_for_track: Dict[int, Tuple[int, float]] = {}
+        best_track_for_det: Dict[int, Tuple[int, float]] = {}
+        for pid, i, cost, _ in candidates:
+            if (pid not in best_det_for_track) or (cost < best_det_for_track[pid][1]):
+                best_det_for_track[pid] = (i, cost) # Mejor deteccion para cada candidato
+            if (i not in best_track_for_det) or (cost < best_track_for_det[i][1]):
+                best_track_for_det[i] = (pid, cost) # Mejor candidato para cada deteccion
+
+        # 1) Acepta los mutuos
+        for pid, (i, c) in best_det_for_track.items():
+            pid2, c2 = best_track_for_det.get(i, (None, None))
+            if pid2 == pid:
+                assigned_det[i] = pid
+                used_tracks.add(pid)
+
+        # 2) Reglas extra: si no es mutuo, acepta solo si coste es muy bueno (d2 bajo + IoU decente)
+        for pid, (i, c) in best_det_for_track.items():
+            if i in assigned_det:
+                continue
+            if pid in used_tracks:
+                continue
+            cen_i = det_centers[i]
+            d2 = kalmans[pid].mahalanobis2(cen_i) if pid in kalmans else 0.0
+            iou_ok = True
+            kp_prev = prev_map.get(pid, None)
+            if kp_prev is not None:
+                iou_ok = iou_from_boxes(keypoints_to_box(kp_prev), det_bboxes[i]) > 0.2
+            if d2 <= 5.99 and iou_ok:
+                assigned_det[i] = pid
+                used_tracks.add(pid)
 
     # --------- Construye salida y estados ---------
     personas_def = deepcopy(personas_actual)
@@ -449,6 +602,7 @@ def seleccionar_asignacion_definitiva(
             m['lost_time'] = 0.0
             m['just_coasted'] = False
             m['quarantine_until'] = 0.0
+            m["last_keypoints"] = persona['keypoints']
         else:
             # Sin asignación todavía; lo resolveremos con re-ID o nacimiento
             persona['id'] = None
@@ -463,6 +617,7 @@ def seleccionar_asignacion_definitiva(
         m['just_coasted'] = True
         m['lost_time'] = m.get('lost_time', 0.0) + dt_seconds
         m['quarantine_until'] = max(m.get('quarantine_until', 0.0), t_now + quarantine_seconds)
+        m["last_keypoints"] = [p["keypoints"] for p in personas_anterior if p["id"] == pid]
 
     # --------- Re-ID desde desaparecidos (post-proceso estricto) ---------
     # Intenta asignar IDs faltantes a detecciones aún libres
@@ -479,7 +634,11 @@ def seleccionar_asignacion_definitiva(
                 if kalmans[pid].mahalanobis2(cen_i) > 5.99:
                     continue
             d2 = kalmans[pid].mahalanobis2(cen_i)
-            kp_prev = prev_map.get(pid, None)
+            if pid in prev_map:
+                kp_prev = prev_map.get(pid, None)
+            else:
+                kp_prev = track_meta.get(pid, {}).get("last_keypoints", None)
+
             bb_prev = keypoints_to_box(kp_prev) if kp_prev is not None else (0, 0, 0, 0)
             iou = iou_from_boxes(bb_prev, bb_i)
             score = d2 + (1.0 - iou)
@@ -496,8 +655,12 @@ def seleccionar_asignacion_definitiva(
             m['lost_time'] = 0.0
             m['just_coasted'] = False
             m['quarantine_until'] = 0.0
+            m["last_keypoints"] = personas_def[i]['keypoints']
 
     # --------- Nacimiento de nuevos IDs para detecciones aún libres ---------
+    ids_usados = set(ids_elegidos) | {p['id'] for p in personas_anterior if p.get('id') is not None}
+    if ids_usados:
+        next_id = max(next_id, max(ids_usados) + 1)
     for i, persona in enumerate(personas_def):
         if persona['id'] is None:
             persona['id'] = next_id
@@ -512,6 +675,7 @@ def seleccionar_asignacion_definitiva(
             m['lost_time'] = 0.0
             m['just_coasted'] = False
             m['quarantine_until'] = 0.0
+            m["last_keypoints"] = persona['keypoints']
             next_id += 1
 
     # --------- Vida y limpieza: elimina tracks tras timeout ---------

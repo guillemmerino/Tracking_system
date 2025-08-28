@@ -73,12 +73,14 @@ def asignar_ids_por_hungaro(personas_actual, personas_anterior, next_id, umbral=
             next_id += 1
 
     # 7) Relleno de keypoints =0 con último válido del mismo ID
-    keypoints_prev_map = {p['id']: p['keypoints'] for p in personas_anterior}
-    for p in personas_actual:
-        pid = p.get('id')
-        if pid in keypoints_prev_map:
-            last_valid = keypoints_prev_map[pid]
-            p['keypoints'] = np.where(p['keypoints'] == 0, last_valid, p['keypoints'])
+    #keypoints_prev_map = {p['id']: p['keypoints'] for p in personas_anterior}
+    #for p in personas_actual:
+    #    pid = p.get('id')
+    #    if pid in keypoints_prev_map:
+    #        last_valid = keypoints_prev_map[pid]
+    #        p['keypoints'] = np.where(p['keypoints'] == 0, last_valid, p['keypoints'])
+
+    # SE DEVUELVE EL ORIGINAL SIN MODIFICACIONES DE KP
 
     # 8) Desaparecidos: anteriores no usados
     for j, p in enumerate(personas_anterior):

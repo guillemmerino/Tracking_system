@@ -2,6 +2,24 @@ import csv
 import numpy as np
 
 
+def _to_xy_and_mask(kp):
+    """kp: (J,2)/(J,3) o plano 2J/3J -> (J,2), mask(J,)"""
+    a = np.asarray(kp, dtype=float).reshape(-1)
+    step = 3 if (a.size % 3 == 0) else 2
+    xs, ys = a[0::step], a[1::step]
+    xy = np.stack([xs, ys], axis=-1)         # (J,2)
+    mask = (xs != 0) & (ys != 0)             # visibles
+    return xy, mask
+
+def kp_rmse(a, b):
+    a = np.asarray(a, float).reshape(-1); b = np.asarray(b, float).reshape(-1)
+    step = 3 if (a.size%3==0 and b.size%3==0) else 2
+    ax, ay = a[0::step], a[1::step]; bx, by = b[0::step], b[1::step]
+    m = (ax!=0)&(ay!=0)&(bx!=0)&(by!=0)
+    if not np.any(m): return float('inf')
+    dx, dy = ax[m]-bx[m], ay[m]-by[m]
+    return float(np.sqrt(((dx*dx+dy*dy)).mean()))
+
 
 def asignar_ids_por_proximidad(personas_actual, personas_anterior, next_id, umbral=1.0):
     """
@@ -44,10 +62,12 @@ def asignar_ids_por_proximidad(personas_actual, personas_anterior, next_id, umbr
     )
 
     # Distancia euclídea por-par tras el relleno
-    diff = actual_filled_3d - keypoints_anterior[None, :, :]
-    dist_matrix = np.linalg.norm(diff, axis=2)  # (M, N)
-    
+    dist_matrix = np.empty((M, N), dtype=float)
+    for i in range(M):
+        for j in range(N):
+            dist_matrix[i, j] = kp_rmse(actual_filled_3d[i, j, :], keypoints_anterior[j])
 
+    #print("Matriz de distancias (RMSE por joint visible):", dist_matrix)
     asignaciones = [None] * len(personas_actual)
     usados_actual = set()
     usados_anterior = set()
@@ -83,10 +103,13 @@ def asignar_ids_por_proximidad(personas_actual, personas_anterior, next_id, umbr
             keypoints_prev_map[p['id']] = p['keypoints']
 
     # Rellenar valores 0 en keypoints con el último valor válido del mismo ID
-    for persona in personas_actual:
-        if persona['id'] is not None and persona['id'] in keypoints_prev_map:
-            last_valid = keypoints_prev_map[persona['id']]
-            persona['keypoints'] = np.where(persona['keypoints'] == 0, last_valid, persona['keypoints'])
+    #for persona in personas_actual:
+    #    if persona['id'] is not None and persona['id'] in keypoints_prev_map:
+    #        last_valid = keypoints_prev_map[persona['id']]
+    #        persona['keypoints'] = np.where(persona['keypoints'] == 0, last_valid, persona['keypoints'])
+
+        # SE DEVUELVE EL ORIGINAL SIN MODIFICACIONES DE KP
+
 
     # Personas desaparecidas: aquellas de personas_anterior cuyo índice no está en usados_anterior
     for j, p in enumerate(personas_anterior):
